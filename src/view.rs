@@ -14,7 +14,7 @@ use crate::{
     lsp::diagnostics::DiagnosticStore,
     picker::Picker,
     search::SearchState,
-    syntax::{StyledSegment, SyntaxHighlighter},
+    syntax::{StyledSegment, SyntaxCache, SyntaxHighlighter},
 };
 
 const GUTTER_FG: Color = Color::DarkGrey;
@@ -29,6 +29,7 @@ pub struct View {
     pub top_line: usize,
     pub left_col: usize,
     preferred_col: Option<usize>,
+    syntax_cache: SyntaxCache,
 }
 
 pub enum OverlayInfo<'a> {
@@ -107,15 +108,29 @@ impl View {
         draw_menu(out, width)?;
 
         let gutter = gutter_width(info.buffer);
-        for screen_row in 0..text_height(height) {
+        let rows = text_height(height);
+        if rows > 0 {
+            let last_visible = self.top_line.saturating_add(rows - 1);
+            self.syntax_cache.ensure_highlighted(
+                info.syntax,
+                info.buffer.path(),
+                info.buffer.version(),
+                info.buffer.line_count(),
+                last_visible,
+                || info.buffer.text(),
+            );
+        }
+        for screen_row in 0..rows {
             let line_idx = self.top_line + screen_row;
             let y = editor_y(screen_row);
             queue!(out, MoveTo(0, y), ResetColor)?;
             draw_gutter(out, info.buffer, info.diagnostics, line_idx, gutter)?;
             if line_idx < info.buffer.line_count() {
+                let segments = self.syntax_cache.line(line_idx);
                 draw_line(
                     out,
                     &info,
+                    segments,
                     line_idx,
                     gutter,
                     width,
@@ -256,6 +271,7 @@ fn draw_gutter(
 fn draw_line(
     out: &mut impl Write,
     info: &RenderInfo<'_>,
+    segments: &[StyledSegment],
     line_idx: usize,
     gutter: u16,
     width: u16,
@@ -263,10 +279,8 @@ fn draw_line(
     top_line: usize,
     y_offset: u16,
 ) -> io::Result<()> {
-    let line = info.buffer.line_text(line_idx);
     let line_start = info.buffer.line_start(line_idx);
-    let path = info.buffer.path();
-    let segments = info.syntax.highlight_line(path, &line);
+    let line_len = info.buffer.line_end(line_idx).saturating_sub(line_start);
     let mut byte_col = 0usize;
     let mut visual = 0usize;
     let max_cols = width as usize;
@@ -275,9 +289,10 @@ fn draw_line(
         draw_segment(
             out,
             info,
-            &segment,
+            segment,
             line_idx,
             line_start,
+            line_len,
             &mut byte_col,
             &mut visual,
             gutter as usize,
@@ -300,6 +315,7 @@ fn draw_segment(
     segment: &StyledSegment,
     line_idx: usize,
     line_start: usize,
+    line_len: usize,
     byte_col: &mut usize,
     visual: &mut usize,
     gutter: usize,
@@ -325,11 +341,10 @@ fn draw_segment(
                     .selected_range()
                     .is_some_and(|range| range.start <= abs && abs < range.end);
                 let search_hit = search_color(info.search, abs).is_some();
-                if info.diagnostics.highlights_position(
-                    line_idx,
-                    *byte_col,
-                    info.buffer.line_text(line_idx).len(),
-                ) {
+                if info
+                    .diagnostics
+                    .highlights_position(line_idx, *byte_col, line_len)
+                {
                     queue!(
                         out,
                         SetAttribute(Attribute::Underlined),
