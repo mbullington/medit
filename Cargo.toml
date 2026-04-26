@@ -1,0 +1,20 @@
+[package]
+name = "medit"
+version = "0.1.0"
+edition = "2024"
+description = "A personal modeless terminal text editor"
+
+[dependencies]
+arboard = "3.4"
+crossterm = "0.28"
+ignore = "0.4"
+lsp-types = "0.95"
+nucleo = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syntect = "5.2"
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
