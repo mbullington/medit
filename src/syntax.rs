@@ -4,7 +4,7 @@ use crossterm::style::Color;
 use syntect::{
     easy::HighlightLines,
     highlighting::{Color as SynColor, HighlightState, Style, Theme, ThemeSet},
-    parsing::{ParseState, SyntaxSet},
+    parsing::{ParseState, SyntaxDefinition, SyntaxSet},
 };
 
 #[derive(Clone, Debug)]
@@ -95,7 +95,7 @@ impl SyntaxCache {
 
 impl SyntaxHighlighter {
     pub fn new(configured_theme: Option<&str>) -> Self {
-        let ps = SyntaxSet::load_defaults_newlines();
+        let ps = load_syntax_set();
         let ts = ThemeSet::load_defaults();
         let (theme, theme_name) = configured_theme
             .and_then(|theme| load_theme(theme, &ts))
@@ -125,6 +125,36 @@ impl SyntaxHighlighter {
             .unwrap_or_else(|| self.ps.find_syntax_plain_text())
     }
 }
+
+fn load_syntax_set() -> SyntaxSet {
+    let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+    for (name, syntax) in EXTRA_SYNTAXES {
+        builder.add(
+            SyntaxDefinition::load_from_str(syntax, true, Some(name))
+                .unwrap_or_else(|err| panic!("bundled syntax definition {name} is invalid: {err}")),
+        );
+    }
+    builder.build()
+}
+
+const EXTRA_SYNTAXES: &[(&str, &str)] = &[
+    (
+        "TOML.sublime-syntax",
+        include_str!("../assets/syntaxes/TOML.sublime-syntax"),
+    ),
+    (
+        "TypeScript.sublime-syntax",
+        include_str!("../assets/syntaxes/TypeScript.sublime-syntax"),
+    ),
+    (
+        "TypeScriptReact.sublime-syntax",
+        include_str!("../assets/syntaxes/TypeScriptReact.sublime-syntax"),
+    ),
+    (
+        "JavaScriptBabel.sublime-syntax",
+        include_str!("../assets/syntaxes/JavaScriptBabel.sublime-syntax"),
+    ),
+];
 
 fn line_at(text: &str, byte_offset: usize) -> (&str, usize) {
     let rest = text.get(byte_offset..).unwrap_or_default();
@@ -214,6 +244,53 @@ fn syn_to_term(color: SynColor) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adds_syntaxes_missing_from_syntect_defaults() {
+        let highlighter = SyntaxHighlighter::new(None);
+
+        assert_eq!(
+            highlighter
+                .syntax_for_path(Some(Path::new("Cargo.toml")))
+                .name,
+            "TOML"
+        );
+        assert_eq!(
+            highlighter.syntax_for_path(Some(Path::new("app.ts"))).name,
+            "TypeScript"
+        );
+        assert_eq!(
+            highlighter.syntax_for_path(Some(Path::new("app.tsx"))).name,
+            "TypeScriptReact"
+        );
+        assert_eq!(
+            highlighter.syntax_for_path(Some(Path::new("app.jsx"))).name,
+            "JavaScript (Babel)"
+        );
+    }
+
+    #[test]
+    fn highlights_toml_and_typescript() {
+        let highlighter = SyntaxHighlighter::new(None);
+
+        let mut toml_cache = SyntaxCache::default();
+        toml_cache.ensure_highlighted(&highlighter, Some(Path::new("Cargo.toml")), 0, 1, 0, || {
+            "name = \"medit\" # package\n".to_string()
+        });
+        assert_ne!(
+            fg_for(toml_cache.line(0), "name"),
+            fg_for(toml_cache.line(0), "#")
+        );
+
+        let mut ts_cache = SyntaxCache::default();
+        ts_cache.ensure_highlighted(&highlighter, Some(Path::new("app.ts")), 0, 1, 0, || {
+            "const value = 1; // hello\n".to_string()
+        });
+        assert_ne!(
+            fg_for(ts_cache.line(0), "const"),
+            fg_for(ts_cache.line(0), "//")
+        );
+    }
 
     #[test]
     fn highlights_multiline_blocks_with_prior_line_state() {
