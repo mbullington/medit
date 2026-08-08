@@ -83,6 +83,7 @@ pub struct App {
     syntax: SyntaxHighlighter,
     config: Config,
     lsp: Option<LspClient>,
+    lsp_failure: Option<String>,
     diagnostics: DiagnosticStore,
     clipboard: Option<Clipboard>,
     indent: IndentStyle,
@@ -111,6 +112,7 @@ impl App {
             syntax,
             config,
             lsp: None,
+            lsp_failure: None,
             diagnostics: DiagnosticStore::default(),
             clipboard: Clipboard::new().ok(),
             indent,
@@ -183,7 +185,13 @@ impl App {
             .lsp
             .as_ref()
             .map(|lsp| format!("LSP:{}", lsp.language_id()))
-            .unwrap_or_else(|| "LSP:off".to_string());
+            .unwrap_or_else(|| {
+                if self.lsp_failure.is_some() {
+                    "LSP:failed".to_string()
+                } else {
+                    "LSP:off".to_string()
+                }
+            });
         self.view.render(
             out,
             RenderInfo {
@@ -194,6 +202,7 @@ impl App {
                 overlay,
                 status_message: &self.status,
                 lsp_status: &lsp_status,
+                lsp_failure: self.lsp_failure.as_deref(),
             },
         )
     }
@@ -390,8 +399,8 @@ impl App {
         match result {
             Ok(()) => {
                 self.status = "Saved".into();
-                if let Some(lsp) = &mut self.lsp {
-                    lsp.notify_did_change(&self.buffer);
+                if let Some(lsp) = &self.lsp {
+                    lsp.notify_did_save(&self.buffer);
                 }
             }
             Err(err) => self.status = format!("Save failed: {err}"),
@@ -564,8 +573,9 @@ impl App {
     }
 
     fn scroll_view(&mut self, delta: isize) {
+        let reserved_rows = 2 + usize::from(self.lsp_failure.is_some());
         let visible = terminal::size()
-            .map(|(_, height)| height.saturating_sub(2) as usize)
+            .map(|(_, height)| (height as usize).saturating_sub(reserved_rows))
             .unwrap_or(22)
             .max(1);
         let max_top = self.buffer.line_count().saturating_sub(1);
@@ -651,7 +661,8 @@ impl App {
 
     fn offset_for_mouse(&self, column: u16, row: u16) -> usize {
         let gutter = self.gutter_width() as usize;
-        let text_row = row.saturating_sub(1) as usize;
+        let editor_start = 1 + u16::from(self.lsp_failure.is_some());
+        let text_row = row.saturating_sub(editor_start) as usize;
         let line = (self.view.top_line + text_row).min(self.buffer.line_count().saturating_sub(1));
         let col = (column as usize).saturating_sub(gutter) + self.view.left_col;
         self.buffer.offset_for_line_col(line, col)
@@ -701,6 +712,8 @@ impl App {
 
     fn start_lsp(&mut self) {
         self.lsp = None;
+        self.lsp_failure = None;
+        self.diagnostics = DiagnosticStore::default();
         let Some(path) = self.buffer.path() else {
             self.status = "No file path; LSP off".into();
             return;
@@ -710,7 +723,11 @@ impl App {
         };
         match LspClient::spawn(config, &self.buffer, &self.cwd) {
             Ok(client) => self.lsp = Some(client),
-            Err(err) => self.status = format!("LSP unavailable: {err}"),
+            Err(err) => {
+                let error = format!("LSP unavailable: {err}");
+                self.status = error.clone();
+                self.lsp_failure = Some(error);
+            }
         }
     }
 
@@ -720,6 +737,7 @@ impl App {
         };
         let events = lsp.poll(&self.buffer);
         let changed = !events.is_empty();
+        let mut failure = None;
         for event in events {
             match event {
                 LspEvent::Diagnostics(diagnostics) => self.diagnostics.set(diagnostics),
@@ -735,6 +753,16 @@ impl App {
                     }
                 }
                 LspEvent::Status(status) => self.status = status,
+                LspEvent::Failed(error) => failure = Some(error),
+            }
+        }
+        if let Some(error) = failure {
+            self.lsp = None;
+            self.diagnostics = DiagnosticStore::default();
+            self.status = error.clone();
+            self.lsp_failure = Some(error);
+            if let Mode::CodeActions { loading, .. } = &mut self.mode {
+                *loading = false;
             }
         }
         changed
@@ -742,7 +770,7 @@ impl App {
 
     fn open_code_actions(&mut self) {
         let (line, col) = self.buffer.line_col();
-        let diagnostics = self.diagnostics.at_position(line, col);
+        let diagnostics = self.diagnostics.at_position(&self.buffer, line, col);
         let message = diagnostics
             .first()
             .map(|diagnostic| diagnostic.message.clone())

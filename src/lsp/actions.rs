@@ -101,9 +101,36 @@ fn collect_text_edits(buffer: &Buffer, text_edits: &Value, out: &mut Vec<Pending
             .unwrap_or_default()
             .to_string();
         out.push(PendingEdit {
-            start: buffer.offset_for_line_col(start_line as usize, start_col as usize),
-            end: buffer.offset_for_line_col(end_line as usize, end_col as usize),
+            start: buffer.offset_for_utf16_position(start_line as usize, start_col as usize),
+            end: buffer.offset_for_utf16_position(end_line as usize, end_col as usize),
             new_text,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn applies_edits_with_utf16_columns() {
+        let mut buffer = Buffer::empty(None);
+        buffer.insert_str("a😀b");
+        let edit = json!({
+            "changes": {
+                "file:///test.rs": [{
+                    "range": {
+                        "start": { "line": 0, "character": 1 },
+                        "end": { "line": 0, "character": 3 }
+                    },
+                    "newText": "fixed"
+                }]
+            }
+        });
+
+        assert_eq!(apply_workspace_edit(&mut buffer, &edit), 1);
+        assert_eq!(buffer.text(), "afixedb");
     }
 }

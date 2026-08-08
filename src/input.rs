@@ -153,3 +153,16 @@ fn mouse_to_action(mouse: MouseEvent) -> Action {
         _ => Action::None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_code_action_shortcut() {
+        assert!(matches!(
+            key_to_action(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL)),
+            Action::ShowCodeActions
+        ));
+    }
+}

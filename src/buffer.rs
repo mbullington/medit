@@ -206,6 +206,33 @@ impl Buffer {
         (start + col).min(end)
     }
 
+    pub fn utf16_col_for_byte_col(&self, line: usize, byte_col: usize) -> usize {
+        let text = self.line_text(line);
+        let mut boundary = byte_col.min(text.len());
+        while !text.is_char_boundary(boundary) {
+            boundary = boundary.saturating_sub(1);
+        }
+        text[..boundary].encode_utf16().count()
+    }
+
+    pub fn offset_for_utf16_position(&self, line: usize, utf16_col: usize) -> usize {
+        let line = line.min(self.line_count().saturating_sub(1));
+        let text = self.line_text(line);
+        let mut units = 0;
+        let mut byte_col = 0;
+
+        for ch in text.chars() {
+            let next_units = units + ch.len_utf16();
+            if next_units > utf16_col {
+                break;
+            }
+            units = next_units;
+            byte_col += ch.len_utf8();
+        }
+
+        self.line_start(line) + byte_col
+    }
+
     pub fn selected_range(&self) -> Option<Range<usize>> {
         let anchor = self.selection_anchor?;
         let cursor = self.cursor();
@@ -464,5 +491,19 @@ mod tests {
         assert_eq!(b.text(), "hello\nworld");
         assert!(b.redo());
         assert_eq!(b.text(), "hello, there\nworld");
+    }
+
+    #[test]
+    fn converts_between_byte_and_utf16_columns() {
+        let mut buffer = Buffer::empty(None);
+        buffer.insert_str("a😀éb");
+
+        assert_eq!(buffer.utf16_col_for_byte_col(0, 1), 1);
+        assert_eq!(buffer.utf16_col_for_byte_col(0, 5), 3);
+        assert_eq!(buffer.utf16_col_for_byte_col(0, 7), 4);
+        assert_eq!(buffer.offset_for_utf16_position(0, 1), 1);
+        assert_eq!(buffer.offset_for_utf16_position(0, 3), 5);
+        assert_eq!(buffer.offset_for_utf16_position(0, 4), 7);
+        assert_eq!(buffer.offset_for_utf16_position(0, 99), buffer.len());
     }
 }

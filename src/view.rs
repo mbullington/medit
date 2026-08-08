@@ -58,6 +58,7 @@ pub struct RenderInfo<'a> {
     pub overlay: OverlayInfo<'a>,
     pub status_message: &'a str,
     pub lsp_status: &'a str,
+    pub lsp_failure: Option<&'a str>,
 }
 
 impl View {
@@ -75,9 +76,15 @@ impl View {
         self.preferred_col = None;
     }
 
-    pub fn ensure_cursor_visible(&mut self, buffer: &Buffer, height: u16, width: u16) {
+    pub fn ensure_cursor_visible(
+        &mut self,
+        buffer: &Buffer,
+        height: u16,
+        width: u16,
+        notice_rows: usize,
+    ) {
         let (line, col) = buffer.line_col();
-        let text_rows = text_height(height);
+        let text_rows = text_height(height, notice_rows);
         if line < self.top_line {
             self.top_line = line;
         } else if text_rows > 0 && line >= self.top_line + text_rows {
@@ -95,7 +102,8 @@ impl View {
 
     pub fn render(&mut self, out: &mut impl Write, info: RenderInfo<'_>) -> io::Result<()> {
         let (width, height) = terminal::size()?;
-        self.ensure_cursor_visible(info.buffer, height, width);
+        let notice_rows = usize::from(info.lsp_failure.is_some());
+        self.ensure_cursor_visible(info.buffer, height, width, notice_rows);
 
         queue!(
             out,
@@ -106,9 +114,13 @@ impl View {
         )?;
 
         draw_menu(out, width)?;
+        if let Some(error) = info.lsp_failure {
+            draw_lsp_failure(out, error, width)?;
+        }
 
         let gutter = gutter_width(info.buffer);
-        let rows = text_height(height);
+        let rows = text_height(height, notice_rows);
+        let editor_start = 1 + notice_rows as u16;
         if rows > 0 {
             let last_visible = self.top_line.saturating_add(rows - 1);
             self.syntax_cache.ensure_highlighted(
@@ -122,7 +134,7 @@ impl View {
         }
         for screen_row in 0..rows {
             let line_idx = self.top_line + screen_row;
-            let y = editor_y(screen_row);
+            let y = editor_y(screen_row, notice_rows);
             queue!(out, MoveTo(0, y), ResetColor)?;
             draw_gutter(out, info.buffer, info.diagnostics, line_idx, gutter)?;
             if line_idx < info.buffer.line_count() {
@@ -136,7 +148,7 @@ impl View {
                     width,
                     self.left_col,
                     self.top_line,
-                    1,
+                    editor_start,
                 )?;
             }
             queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
@@ -183,7 +195,7 @@ impl View {
         }
 
         let (line, col) = info.buffer.line_col();
-        let cursor_y = editor_y(line.saturating_sub(self.top_line));
+        let cursor_y = editor_y(line.saturating_sub(self.top_line), notice_rows);
         let cursor_line = info.buffer.line_text(line);
         let cursor_prefix = cursor_line.get(..col.min(cursor_line.len())).unwrap_or("");
         let cursor_x =
@@ -230,6 +242,20 @@ fn draw_menu(out: &mut impl Write, width: u16) -> io::Result<()> {
         x = x.saturating_add(label.len() as u16 + 1);
     }
     queue!(out, ResetColor, SetAttribute(Attribute::Reset))
+}
+
+fn draw_lsp_failure(out: &mut impl Write, error: &str, width: u16) -> io::Result<()> {
+    let message = format!(" LSP failure: {error} ");
+    queue!(
+        out,
+        MoveTo(0, 1),
+        ResetColor,
+        SetForegroundColor(Color::Red),
+        SetAttribute(Attribute::Bold),
+        Print(pad(&message, width as usize)),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
+    )
 }
 
 fn draw_gutter(
@@ -282,6 +308,7 @@ fn draw_line(
     let line_start = info.buffer.line_start(line_idx);
     let line_len = info.buffer.line_end(line_idx).saturating_sub(line_start);
     let mut byte_col = 0usize;
+    let mut utf16_col = 0usize;
     let mut visual = 0usize;
     let max_cols = width as usize;
 
@@ -294,6 +321,7 @@ fn draw_line(
             line_start,
             line_len,
             &mut byte_col,
+            &mut utf16_col,
             &mut visual,
             gutter as usize,
             max_cols,
@@ -317,6 +345,7 @@ fn draw_segment(
     line_start: usize,
     line_len: usize,
     byte_col: &mut usize,
+    utf16_col: &mut usize,
     visual: &mut usize,
     gutter: usize,
     max_cols: usize,
@@ -343,7 +372,7 @@ fn draw_segment(
                 let search_hit = search_color(info.search, abs).is_some();
                 if info
                     .diagnostics
-                    .highlights_position(line_idx, *byte_col, line_len)
+                    .highlights_position(line_idx, *utf16_col, *byte_col < line_len)
                 {
                     queue!(
                         out,
@@ -373,6 +402,7 @@ fn draw_segment(
         }
         *visual += char_width;
         *byte_col += ch.len_utf8();
+        *utf16_col += ch.len_utf16();
     }
     Ok(())
 }
@@ -647,12 +677,12 @@ fn gutter_width(buffer: &Buffer) -> u16 {
     (digits + 3) as u16
 }
 
-fn text_height(height: u16) -> usize {
-    height.saturating_sub(2) as usize
+fn text_height(height: u16, notice_rows: usize) -> usize {
+    (height as usize).saturating_sub(2 + notice_rows)
 }
 
-fn editor_y(screen_row: usize) -> u16 {
-    screen_row.saturating_add(1) as u16
+fn editor_y(screen_row: usize, notice_rows: usize) -> u16 {
+    screen_row.saturating_add(1 + notice_rows) as u16
 }
 
 fn visual_col(s: &str) -> usize {

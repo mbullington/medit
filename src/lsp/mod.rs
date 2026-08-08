@@ -4,18 +4,22 @@ pub mod transport;
 
 use std::{collections::HashMap, io, path::Path};
 
-use lsp_types::{Diagnostic, Position, PublishDiagnosticsParams, Range};
+use lsp_types::{Diagnostic, Position, PublishDiagnosticsParams, Range, Url};
 use serde_json::{Value, json};
 
 use crate::{buffer::Buffer, config::LspServerConfig};
 
-use self::{actions::CodeActionItem, transport::LspTransport};
+use self::{
+    actions::CodeActionItem,
+    transport::{LspTransport, TransportPoll},
+};
 
 #[derive(Clone, Debug)]
 pub enum LspEvent {
     Diagnostics(Vec<Diagnostic>),
     CodeActions(Vec<CodeActionItem>),
     Status(String),
+    Failed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -28,12 +32,14 @@ enum PendingRequest {
 pub struct LspClient {
     transport: LspTransport,
     config: LspServerConfig,
-    uri: String,
-    root_uri: String,
+    uri: Url,
+    root_uri: Url,
     next_id: i64,
     pending: HashMap<i64, PendingRequest>,
     initialized: bool,
     opened: bool,
+    save_include_text: Option<bool>,
+    disconnected: bool,
 }
 
 impl LspClient {
@@ -43,8 +49,8 @@ impl LspClient {
             .path()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| root.join("untitled"));
-        let uri = file_uri(&path);
-        let root_uri = file_uri(root);
+        let uri = file_uri(&path)?;
+        let root_uri = file_uri(root)?;
         let mut this = Self {
             transport,
             config,
@@ -54,6 +60,8 @@ impl LspClient {
             pending: HashMap::new(),
             initialized: false,
             opened: false,
+            save_include_text: None,
+            disconnected: false,
         };
         this.initialize();
         Ok(this)
@@ -61,8 +69,20 @@ impl LspClient {
 
     pub fn poll(&mut self, buffer: &Buffer) -> Vec<LspEvent> {
         let mut events = Vec::new();
-        while let Some(message) = self.transport.try_recv() {
-            self.handle_message(message, buffer, &mut events);
+        loop {
+            match self.transport.try_recv() {
+                TransportPoll::Message(message) => {
+                    self.handle_message(message, buffer, &mut events);
+                }
+                TransportPoll::Empty => break,
+                TransportPoll::Disconnected(error) => {
+                    if !self.disconnected {
+                        self.disconnected = true;
+                        events.push(LspEvent::Failed(format!("LSP disconnected: {error}")));
+                    }
+                    break;
+                }
+            }
         }
         events
     }
@@ -83,17 +103,32 @@ impl LspClient {
         );
     }
 
+    pub fn notify_did_save(&self, buffer: &Buffer) {
+        if !self.initialized || !self.opened {
+            return;
+        }
+        let Some(include_text) = self.save_include_text else {
+            return;
+        };
+        let mut params = json!({ "textDocument": { "uri": self.uri } });
+        if include_text {
+            params["text"] = Value::String(buffer.text());
+        }
+        self.send_notification("textDocument/didSave", params);
+    }
+
     pub fn request_code_actions(&mut self, buffer: &Buffer, diagnostics: Vec<Diagnostic>) {
         if !self.initialized || !self.opened {
             return;
         }
-        let (line, col) = buffer.line_col();
+        let (line, byte_col) = buffer.line_col();
+        let utf16_col = buffer.utf16_col_for_byte_col(line, byte_col);
         let range = diagnostics
             .first()
             .map(|d| d.range)
             .unwrap_or_else(|| Range {
-                start: Position::new(line as u32, col as u32),
-                end: Position::new(line as u32, col as u32),
+                start: Position::new(line as u32, utf16_col as u32),
+                end: Position::new(line as u32, utf16_col as u32),
             });
         let id = self.send_request(
             "textDocument/codeAction",
@@ -147,7 +182,8 @@ impl LspClient {
                         },
                         "synchronization": { "didSave": true, "willSave": false, "willSaveWaitUntil": false }
                     },
-                    "workspace": { "applyEdit": true, "configuration": true, "workspaceEdit": { "documentChanges": true } }
+                    "workspace": { "applyEdit": true, "configuration": true, "workspaceEdit": { "documentChanges": true } },
+                    "general": { "positionEncodings": ["utf-16"] }
                 },
                 "workspaceFolders": null,
             }),
@@ -182,8 +218,10 @@ impl LspClient {
                     if let Some(params) = message.get("params")
                         && let Ok(params) =
                             serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
+                        && let Some(diagnostics) =
+                            diagnostics_for_buffer(params, &self.uri, buffer.version())
                     {
-                        events.push(LspEvent::Diagnostics(params.diagnostics));
+                        events.push(LspEvent::Diagnostics(diagnostics));
                     }
                 }
                 "window/showMessage" | "window/logMessage" => {
@@ -207,12 +245,18 @@ impl LspClient {
             return;
         };
         if let Some(error) = message.get("error") {
-            events.push(LspEvent::Status(format!("LSP error: {error}")));
+            let error = format!("LSP error: {error}");
+            if matches!(kind, PendingRequest::Initialize) {
+                events.push(LspEvent::Failed(error));
+            } else {
+                events.push(LspEvent::Status(error));
+            }
             return;
         }
         let result = message.get("result").cloned().unwrap_or(Value::Null);
         match kind {
             PendingRequest::Initialize => {
+                self.save_include_text = save_notification_options(&result);
                 self.initialized = true;
                 self.send_notification("initialized", json!({}));
                 self.did_open(buffer);
@@ -304,15 +348,102 @@ fn json_id(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_str()?.parse().ok())
 }
 
-fn file_uri(path: &Path) -> String {
-    let path = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .replace(' ', "%20");
-    if path.starts_with('/') {
-        format!("file://{path}")
+fn save_notification_options(initialize_result: &Value) -> Option<bool> {
+    let save = initialize_result.pointer("/capabilities/textDocumentSync/save")?;
+    match save {
+        Value::Bool(true) => Some(false),
+        Value::Object(options) => Some(
+            options
+                .get("includeText")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        _ => None,
+    }
+}
+
+fn diagnostics_for_buffer(
+    params: PublishDiagnosticsParams,
+    uri: &Url,
+    version: i32,
+) -> Option<Vec<Diagnostic>> {
+    if &params.uri != uri || params.version.is_some_and(|published| published != version) {
+        return None;
+    }
+    Some(params.diagnostics)
+}
+
+fn file_uri(path: &Path) -> io::Result<Url> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        format!("file:///{path}")
+        std::env::current_dir()?.join(path)
+    };
+    let absolute = absolute.canonicalize().unwrap_or(absolute);
+    Url::from_file_path(&absolute).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot convert {} to a file URI", absolute.display()),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use lsp_types::{Diagnostic, Position};
+
+    use super::*;
+
+    fn params(uri: Url, version: Option<i32>) -> PublishDiagnosticsParams {
+        PublishDiagnosticsParams::new(
+            uri,
+            vec![Diagnostic::new_simple(
+                Range::new(Position::new(0, 0), Position::new(0, 1)),
+                "test".into(),
+            )],
+            version,
+        )
+    }
+
+    #[test]
+    fn accepts_only_current_document_diagnostics() {
+        let current = Url::parse("file:///current.rs").unwrap();
+        let other = Url::parse("file:///other.rs").unwrap();
+
+        assert!(diagnostics_for_buffer(params(current.clone(), Some(3)), &current, 3).is_some());
+        assert!(diagnostics_for_buffer(params(current.clone(), None), &current, 3).is_some());
+        assert!(diagnostics_for_buffer(params(current.clone(), Some(2)), &current, 3).is_none());
+        assert!(diagnostics_for_buffer(params(other, Some(3)), &current, 3).is_none());
+    }
+
+    #[test]
+    fn reads_save_notification_options() {
+        assert_eq!(
+            save_notification_options(&json!({
+                "capabilities": { "textDocumentSync": { "save": true } }
+            })),
+            Some(false)
+        );
+        assert_eq!(
+            save_notification_options(&json!({
+                "capabilities": {
+                    "textDocumentSync": { "save": { "includeText": true } }
+                }
+            })),
+            Some(true)
+        );
+        assert_eq!(
+            save_notification_options(&json!({
+                "capabilities": { "textDocumentSync": 1 }
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn file_uris_escape_reserved_characters() {
+        let uri = file_uri(Path::new("/tmp/medit # test.rs")).unwrap();
+
+        assert_eq!(uri.as_str(), "file:///tmp/medit%20%23%20test.rs");
     }
 }

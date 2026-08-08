@@ -1,7 +1,7 @@
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
 };
 
@@ -9,9 +9,15 @@ use serde_json::Value;
 
 use crate::config::LspServerConfig;
 
+pub enum TransportPoll {
+    Message(Value),
+    Empty,
+    Disconnected(String),
+}
+
 pub struct LspTransport {
     outgoing: Sender<Value>,
-    incoming: Receiver<Value>,
+    incoming: Receiver<Result<Value, String>>,
     #[allow(dead_code)]
     child: Child,
 }
@@ -42,7 +48,7 @@ impl LspTransport {
         }
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Value>();
-        let (incoming_tx, incoming_rx) = mpsc::channel::<Value>();
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<Value, String>>();
 
         thread::spawn(move || {
             while let Ok(message) = outgoing_rx.recv() {
@@ -57,12 +63,18 @@ impl LspTransport {
             loop {
                 match read_frame(&mut reader) {
                     Ok(Some(message)) => {
-                        if incoming_tx.send(message).is_err() {
+                        if incoming_tx.send(Ok(message)).is_err() {
                             break;
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
+                    Ok(None) => {
+                        let _ = incoming_tx.send(Err("server closed its output".into()));
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = incoming_tx.send(Err(format!("invalid server output: {err}")));
+                        break;
+                    }
                 }
             }
         });
@@ -78,8 +90,15 @@ impl LspTransport {
         let _ = self.outgoing.send(message);
     }
 
-    pub fn try_recv(&self) -> Option<Value> {
-        self.incoming.try_recv().ok()
+    pub fn try_recv(&self) -> TransportPoll {
+        match self.incoming.try_recv() {
+            Ok(Ok(message)) => TransportPoll::Message(message),
+            Ok(Err(error)) => TransportPoll::Disconnected(error),
+            Err(TryRecvError::Empty) => TransportPoll::Empty,
+            Err(TryRecvError::Disconnected) => {
+                TransportPoll::Disconnected("server connection closed".into())
+            }
+        }
     }
 }
 
