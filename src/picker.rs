@@ -14,29 +14,30 @@ pub struct Picker {
     files: Vec<PathBuf>,
     filtered: Vec<usize>,
     selected: usize,
-    last_refresh: Instant,
+    last_refresh: Option<Instant>,
 }
 
 impl Picker {
     pub fn new(cwd: PathBuf) -> Self {
-        let mut picker = Self {
+        Self {
             active: false,
             query: String::new(),
             cwd,
             files: Vec::new(),
             filtered: Vec::new(),
             selected: 0,
-            last_refresh: Instant::now(),
-        };
-        picker.refresh_files();
-        picker
+            last_refresh: None,
+        }
     }
 
     pub fn open(&mut self) {
         self.active = true;
         self.query.clear();
         self.selected = 0;
-        if self.last_refresh.elapsed().as_secs() > 2 {
+        if self
+            .last_refresh
+            .is_none_or(|last_refresh| last_refresh.elapsed().as_secs() > 2)
+        {
             self.refresh_files();
         }
         self.refilter();
@@ -126,7 +127,7 @@ impl Picker {
             }
         }
         self.files.sort();
-        self.last_refresh = Instant::now();
+        self.last_refresh = Some(Instant::now());
         self.refilter();
     }
 
@@ -150,5 +151,25 @@ impl Picker {
         });
         self.filtered = scored.into_iter().map(|(_, idx)| idx).collect();
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defers_file_indexing_until_opened() {
+        let mut picker = Picker::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+        assert_eq!(picker.results().count(), 0);
+
+        picker.open();
+
+        assert!(
+            picker
+                .results()
+                .any(|(_, path)| path.as_path() == std::path::Path::new("Cargo.toml"))
+        );
     }
 }
